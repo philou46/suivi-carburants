@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Carburants autour de Bétaille</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icon.svg">
+<meta name="theme-color" content="#2e7d32">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+:root { color-scheme: light dark; --fond:#f6f6f4; --texte:#1d1d1b; --carte:#fff; --vert:#2e7d32; --rouge:#b3261e; --gris:#6b6b68; --ligne:#0002; }
+@media (prefers-color-scheme: dark) { :root { --fond:#161816; --texte:#eceae4; --carte:#222420; --gris:#a3a39c; --ligne:#fff2; } }
+* { box-sizing: border-box; }
+body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; background:var(--fond); color:var(--texte); margin:0; padding:16px; }
+main { max-width: 860px; margin: 0 auto; }
+h1 { font-size: 1.4rem; margin: 0 0 4px; }
+h2 { font-size: 1.1rem; margin: 26px 0 8px; }
+.sub { color:var(--gris); font-size:.9rem; margin:0 0 14px; }
+button { font: inherit; padding:10px 16px; border:0; border-radius:10px; background:var(--vert); color:#fff; cursor:pointer; }
+button:disabled { opacity:.5; cursor:wait; }
+.bandeau { padding:10px 12px; border-radius:10px; margin:12px 0; }
+.ok { background:#e6f4ea; color:#1b5e20; }
+.erreur { background:#fde7e9; color:var(--rouge); }
+.info { background:var(--carte); color:var(--gris); }
+.stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+.stats div { background:var(--carte); padding:10px; border-radius:10px; }
+.stats span { display:block; color:var(--gris); font-size:.8rem; }
+.stats strong { font-size:1.15rem; }
+.eco { background:var(--carte); padding:10px 12px; border-radius:10px; margin:8px 0; }
+table { width:100%; border-collapse:collapse; background:var(--carte); border-radius:10px; overflow:hidden; font-size:.92rem; }
+th, td { padding:8px; text-align:left; border-bottom:1px solid var(--ligne); vertical-align:top; }
+tr.meilleur td { color:var(--vert); font-weight:600; }
+.alerte { color:var(--rouge); font-size:.8rem; }
+small { color:var(--gris); }
+a { color:inherit; }
+footer { color:var(--gris); font-size:.8rem; margin:28px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Carburants autour de Bétaille (46110)</h1>
+  <p class="sub" id="meta"></p>
+  <button id="maj">Actualiser les prix</button>
+  <div id="bandeau"></div>
+  <div id="resultats"></div>
+  <h2>Historique (30 derniers jours)</h2>
+  <div id="histo"></div>
+  <footer>
+    Source : data.economie.gouv.fr, « Prix des carburants en France – Flux instantané v2 » (ministère de l'Économie).
+    Les prix sont ceux déclarés par les stations : vérifier sur place avant le plein.
+  </footer>
+</main>
+
+<script>
+// ---------- Réglages ----------
+const LAT = 44.90;      // APPROXIMATIF : corriger avec les coordonnées exactes de Bétaille
+const LON = 1.48;
+const RAYON_KM = 35;
+const LITRES = 40;
+const CARBURANTS = ["SP95-E10", "SP98"];
+const ALERTE_JOURS = 3;
+const CLE_HISTO = "suivi-carburants-historique-v2";
+const CLE_DERNIER = "suivi-carburants-dernier-releve-v2";
+const API = "https://data.economie.gouv.fr/api/explore/v2.1/catalog/datasets/prix-des-carburants-en-france-flux-instantane-v2/records";
+
+// ---------- Outils ----------
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const euros = v => v.toFixed(3).replace(".", ",") + " €";
+const dateFr = d => new Date(d).toLocaleString("fr-FR", { dateStyle: "short", timeStyle: "short" });
+const jourISO = d => { const x = new Date(d); return x.getFullYear() + "-" + String(x.getMonth()+1).padStart(2,"0") + "-" + String(x.getDate()).padStart(2,"0"); };
+
+function distanceKm(lat1, lon1, lat2, lon2) {
+  const r = 6371, rad = x => x * Math.PI / 180;
+  const dp = rad(lat2 - lat1), dl = rad(lon2 - lon1);
+  const a = Math.sin(dp/2)**2 + Math.cos(rad(lat1))*Math.cos(rad(lat2))*Math.sin(dl/2)**2;
+  return 2 * r * Math.asin(Math.sqrt(a));
+}
+
+// ---------- Zones suivies ----------
+const COMMUNES = ["BRETENOUX", "BIARS-SUR-CERE", "BIARS SUR CERE", "VAYRAC", "MARTEL"];
+const CODES_POSTAUX = ["46130", "46110", "46500"];  // Bretenoux et Biars, Vayrac, Martel
+const MOTS_ADRESSE = [/\b4\s*routes\b/i, /\bquatre\s*routes\b/i];
+const sansAccents = s => String(s || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toUpperCase();
+
+function dansZones(s) {
+  const ville = sansAccents(s.ville);
+  if (COMMUNES.some(c => ville.includes(sansAccents(c)))) return true;
+  return MOTS_ADRESSE.some(r => r.test(s.adresse || ""));
+}
+
+// ---------- Source officielle ----------
+async function telechargerStations() {
+  const where = CODES_POSTAUX.map(cp => `cp="${cp}"`).join(" OR ");
+  let out = [], offset = 0;
+  while (true) {
+    const champs = "id,adresse,ville,cp,latitude,longitude,geom,e10_prix,e10_maj,sp98_prix,sp98_maj";
+    const url = `${API}?select=${champs}&where=${encodeURIComponent(where)}&limit=100&offset=${offset}`;
+    const rep = await fetch(url);
+    if (!rep.ok) throw new Error(`la source a répondu ${rep.status}`);
+    const lot = (await rep.json()).results || [];
+    out = out.concat(lot);
+    if (lot.length < 100 || offset >= 900) return out;
+    offset += 100;
+  }
+}
+
+// Gère les deux formats possibles du jeu de données : liste "prix" ou champs à plat
+// Champs à plat de la source : e10_prix = SP95-E10, sp98_prix = SP98 (sp95_prix est le SP95 sans éthanol, non utilisé)
+const CHAMPS_SOURCE = { "SP95-E10": ["e10_prix", "e10_maj"], "SP98": ["sp98_prix", "sp98_maj"] };
+
+function pricesOf(s) {
+  const sortie = [];
+  for (const [carburant, [cPrix, cMaj]] of Object.entries(CHAMPS_SOURCE)) {
+    const valeur = s[cPrix];
+    if (valeur != null && valeur !== "") {
+      sortie.push({ carburant, prix: Number(valeur), maj: s[cMaj] || "" });
+    }
+  }
+  return sortie;
+}
+
+function positionOf(s) {
+  if (s.geom && typeof s.geom === "object") return [s.geom.lat, s.geom.lon];
+  return [s.latitude, s.longitude];
+}
+
+function aplatir(stations) {
+  const lignes = [];
+  for (const s of stations) {
+    const [lat, lon] = positionOf(s);
+    if (lat == null || lon == null) continue;
+    for (const p of pricesOf(s)) {
+      lignes.push({
+        carburant: p.carburant,
+        prix: p.prix,
+        station: s.adresse || String(s.id ?? ""),
+        ville: s.ville || "",
+        distance: distanceKm(LAT, LON, Number(lat), Number(lon)),
+        maj: p.maj,
+        lien: `https://www.google.com/maps/search/?api=1&query=${lat},${lon}`,
+      });
+    }
+  }
+  return lignes;
+}
+
+// ---------- Historique local (navigateur) ----------
+function lireHisto() {
+  try { return JSON.parse(localStorage.getItem(CLE_HISTO)) || []; } catch { return []; }
+}
+// Un seul relevé par jour et par carburant : le plus récent remplace le précédent
+function enregistrerHisto(lignes) {
+  const jour = jourISO(new Date());
+  const releve = new Date().toISOString();
+  const h = lireHisto().filter(x => x.jour !== jour);
+  for (const l of lignes) {
+    h.push({ jour, releve, carburant: l.carburant, prix: l.prix, station: l.station, ville: l.ville });
+  }
+  try {
+    localStorage.setItem(CLE_HISTO, JSON.stringify(h));
+    localStorage.setItem(CLE_DERNIER, JSON.stringify({ releve, lignes }));
+  } catch {}
+  return h;
+}
+
+// ---------- Affichage ----------
+function afficher(lignes, erreur) {
+  const blocs = CARBURANTS.map(c => {
+    const liste = lignes.filter(l => l.carburant === c).sort((a, b) => a.prix - b.prix);
+    if (!liste.length) return `<h2>${esc(c)}</h2><p class="sub">Aucun prix disponible dans la source pour ce carburant.</p>`;
+    const prix = liste.map(l => l.prix).sort((a, b) => a - b);
+    const mini = prix[0], maxi = prix[prix.length - 1];
+    const med = prix.length % 2 ? prix[(prix.length-1)/2] : (prix[prix.length/2-1] + prix[prix.length/2]) / 2;
+    const ecoMax = LITRES * (maxi - mini), ecoMed = LITRES * (med - mini);
+    const lignesTab = liste.map((l, i) => {
+      const age = l.maj ? (Date.now() - new Date(l.maj).getTime()) / 86400000 : null;
+      const alerte = age != null && age > ALERTE_JOURS ? ' <span class="alerte">prix ancien</span>' : "";
+      return `<tr${i === 0 ? ' class="meilleur"' : ""}>
+        <td>${euros(l.prix)}</td>
+        <td><strong>${esc(l.ville)}</strong><br>${esc(l.station)}<br><small>${l.distance.toFixed(1).replace(".", ",")} km de Bétaille</small></td>
+        <td>${l.maj ? dateFr(l.maj) : "—"}${alerte}</td>
+        <td><a href="${esc(l.lien)}" target="_blank" rel="noopener">Carte</a></td></tr>`;
+    }).join("");
+    return `
+      <h2>${esc(c)}</h2>
+      <div class="stats">
+        <div><span>Meilleur prix</span><strong>${euros(mini)}</strong></div>
+        <div><span>Médiane</span><strong>${euros(med)}</strong></div>
+        <div><span>Plus cher</span><strong>${euros(maxi)}</strong></div>
+      </div>
+      <p class="eco">Économie sur ${LITRES} L : <strong>${ecoMax.toFixed(2).replace(".", ",")} €</strong> par rapport à la station la plus chère,
+      <strong>${ecoMed.toFixed(2).replace(".", ",")} €</strong> par rapport à la médiane.</p>
+      <table><thead><tr><th>Prix</th><th>Station</th><th>Mis à jour</th><th>Lien</th></tr></thead>
+      <tbody>${lignesTab}</tbody></table>`;
+  }).join("");
+  $("resultats").innerHTML = blocs;
+
+  if (erreur) {
+    $("bandeau").innerHTML = `<div class="bandeau erreur">La mise à jour a échoué : ${esc(erreur)}<br>
+      Les prix ci-dessous, s'il y en a, proviennent du dernier relevé enregistré.</div>`;
+  } else {
+    $("bandeau").innerHTML = `<div class="bandeau ok">Mise à jour réussie le ${dateFr(new Date())} · ${window.nbStations} station(s) dans le rayon, dont ${window.nbAvecPrix} avec un prix SP95-E10 ou SP98 déclaré.</div>`;
+  }
+  $("meta").textContent = `Bretenoux, Biars-sur-Cère, Vayrac, Martel et Les 4 Routes · volume de calcul ${LITRES} L · historique enregistré sur cet appareil`;
+}
+
+function afficherHisto() {
+  const h = lireHisto();
+  const jours = [...new Set(h.map(x => x.jour))].sort().reverse().slice(0, 30);
+  if (!jours.length) { $("histo").innerHTML = `<p class="sub">Pas encore d'historique : il se remplit à chaque ouverture et mise à jour.</p>`; return; }
+  $("histo").innerHTML = jours.map(j => {
+    const du = h.filter(x => x.jour === j);
+    const parCarburant = CARBURANTS.map(c => {
+      const liste = du.filter(x => x.carburant === c).sort((a, b) => a.prix - b.prix);
+      if (!liste.length) return `<p class="sub">${esc(c)} : aucun prix ce jour-là</p>`;
+      return `<p><strong>${esc(c)}</strong> : minimum ${euros(liste[0].prix)} à ${esc(liste[0].ville)}, ${liste.length} station(s)</p>
+        <details><summary>Voir toutes les stations</summary>
+        <ul>${liste.map(x => `<li>${euros(x.prix)} · ${esc(x.ville)} — ${esc(x.station)}</li>`).join("")}</ul></details>`;
+    }).join("");
+    return `<div style="background:var(--carte);padding:10px 12px;border-radius:10px;margin-bottom:8px">
+      <h3 style="margin:0 0 6px;font-size:1rem">${esc(j)}</h3>${parCarburant}</div>`;
+  }).join("");
+}
+
+// ---------- Action ----------
+async function actualiser() {
+  const bouton = $("maj");
+  bouton.disabled = true; bouton.textContent = "Mise à jour…";
+  try {
+    const toutes = await telechargerStations();
+    const stations = toutes;  // déjà limitées aux codes postaux 46130, 46110, 46500
+    window.nbStations = stations.length;
+    window.nbAvecPrix = stations.filter(s => pricesOf(s).length > 0).length;
+    const lignes = aplatir(stations);
+    if (!lignes.length) {
+      const champs = stations[0] ? Object.keys(stations[0]).join(", ") : "aucune station reçue";
+      console.log("Première station reçue :", JSON.stringify(stations[0], null, 2));
+      throw new Error(`aucun prix SP95-E10 ou SP98 trouvé. ${stations.length} station(s) reçue(s). Champs de la première : ${champs}`);
+    }
+    enregistrerHisto(lignes);
+    afficher(lignes, null);
+  } catch (e) {
+    // Repli : dernier relevé enregistré, jamais de valeur inventée
+    const h = lireHisto();
+    const dernier = h.length ? h[h.length - 1].jour : null;
+    afficher([], `${e.message || e}${dernier ? " (dernier relevé enregistré : " + dernier + ")" : ""}`);
+  } finally {
+    bouton.disabled = false; bouton.textContent = "Actualiser les prix";
+    afficherHisto();
+  }
+}
+
+function afficherDernierReleve() {
+  try {
+    const d = JSON.parse(localStorage.getItem(CLE_DERNIER));
+    if (d && d.lignes) {
+      afficher(d.lignes, null);
+      $("bandeau").innerHTML = `<div class="bandeau info">Dernier relevé du ${dateFr(d.releve)} affiché ; mise à jour en cours…</div>`;
+    }
+  } catch {}
+}
+
+if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
+  navigator.serviceWorker.register("sw.js").catch(() => {});
+}
+
+$("maj").addEventListener("click", actualiser);
+afficherDernierReleve();
+afficherHisto();
+actualiser();
+</script>
+</body>
+</html>
